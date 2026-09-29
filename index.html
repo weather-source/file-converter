@@ -8,9 +8,13 @@
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%23000'/%3E%3Ctext x='32' y='44' font-size='36' text-anchor='middle' fill='%23fff' font-family='monospace'%3E%E8%BD%AC%3C/text%3E%3C/svg%3E">
 </head>
-<body>
+<body data-theme="dark">
 <header class="site-header">
-  <div class="brand"><span class="logo">转</span><h1>本地文件转换器</h1></div>
+  <div class="brand">
+    <span class="logo">转</span>
+    <h1>本地文件转换器</h1>
+    <button id="themeToggle" class="theme-toggle" aria-label="切换深色/浅色主题" title="切换深色/浅色主题">☾</button>
+  </div>
   <p class="tagline">所有转换均在你的浏览器内完成 · 文件不会离开设备</p>
 </header>
 
@@ -22,7 +26,7 @@
       <div class="dz-icon">⇩</div>
       <p class="dz-main">点击选择 / 拖拽文件到此处</p>
       <p class="dz-sub">支持多选 · 可粘贴 Ctrl+V</p>
-      <p class="dz-formats">图片：PNG / JPG / WEBP / GIF / BMP / ICO / SVG / AVIF<br>文档：MD / TXT / HTML / CSV / JSON</p>
+      <p class="dz-formats">图片：PNG / JPG / WEBP / GIF / BMP / ICO / SVG / AVIF<br>文档：MD / TXT / HTML / CSV / JSON<br>演示文稿：PPTX → PDF / PNG（逐页）</p>
     </div>
     <input type="file" id="fileInput" multiple hidden>
     <ul id="fileList" class="file-list"></ul>
@@ -52,8 +56,11 @@
 
 <footer class="site-footer">
   <p>纯前端实现 · 无服务器 · 无上传 · 数据 100% 留在本地</p>
+  <p class="footer-note">PPTX→PDF 为尽力渲染（文本 / 纯色形状 / 图片），复杂动画与母版样式不在还原范围内</p>
 </footer>
 
+<script src="libs/fflate.min.js"></script>
+<script src="libs/pdf-lib.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

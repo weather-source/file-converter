@@ -9,11 +9,15 @@
 | 类型 | 输入 | 输出 |
 |------|------|------|
 | 图片 | PNG / JPG / WEBP / GIF / BMP / ICO / SVG / AVIF | PNG / JPEG / WEBP / BMP / ICO（多尺寸） |
-| 文档 | Markdown / TXT / HTML / CSV / JSON | 相互转换（如 MD↔HTML、CSV↔JSON、MD→TXT 等） |
+| 文档 | Markdown / TXT / HTML / CSV / JSON | 相互转换，及 **PDF**（MD / TXT → A4 排版 PDF） |
+| 演示文稿 | PPTX | **PDF**（逐页渲染）/ PNG（每页一张图） |
+
+> PPTX→PDF 为纯前端尽力渲染：支持文本（字号/加粗/颜色/对齐/自动换行）、纯色形状、嵌入图片；动画、母版与复杂主题样式不在还原范围。旧版 .ppt 请先在 PowerPoint 中另存为 .pptx。
 
 ## 特性
 
-- 纯前端实现，零依赖、零后端，可离线使用
+- 纯前端实现，零后端、无上传，可离线使用（fflate / pdf-lib 已本地化打包）
+- 深色 / 浅色主题一键切换，选择自动记忆
 - 拖拽 / 点击 / Ctrl+V 粘贴添加文件，支持批量转换
 - JPEG / WEBP 输出质量可调
 - 黑白极简 UI，桌面端与移动端自适应

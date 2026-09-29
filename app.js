@@ -4,6 +4,7 @@
 /* ---------- 常量 ---------- */
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "ico", "svg", "avif"];
 const DOC_EXTS = ["md", "markdown", "txt", "html", "htm", "csv", "json"];
+const PPTX_EXTS = ["pptx"];
 
 // 每种输入格式可转换到的目标格式
 const CONV_MAP = {
@@ -18,16 +19,19 @@ const CONV_MAP = {
   svg: ["png", "jpeg", "webp", "bmp", "ico"],
   avif: ["png", "jpeg", "webp", "bmp", "ico"],
   // 文档
-  md: ["html", "txt"],
-  markdown: ["html", "txt"],
-  txt: ["md", "html"],
+  md: ["html", "txt", "pdf"],
+  markdown: ["html", "txt", "pdf"],
+  txt: ["md", "html", "pdf"],
   html: ["md", "txt"],
   htm: ["md", "txt"],
   csv: ["json", "md"],
   json: ["csv", "md"],
+  // 演示文稿
+  pptx: ["pdf", "png"],
 };
 
 const ICO_SIZES = [16, 32, 48, 64, 128, 256];
+const isSupported = (ext) => IMAGE_EXTS.includes(ext) || DOC_EXTS.includes(ext) || ext === "pptx";
 
 /* ---------- 状态 ---------- */
 const state = { files: [], target: null, converting: false };
@@ -471,6 +475,409 @@ async function convertDoc(file, target) {
   throw new Error("不支持的目标格式");
 }
 
+/* ================= PPTX → PDF / PNG（尽力渲染） ================= */
+
+const tagsLocal = (root, name) =>
+  Array.from(root.getElementsByTagName("*")).filter((e) => e.localName === name);
+const attrL = (el, name) => {
+  const a = Array.from(el.attributes).find((x) => x.localName === name);
+  return a ? a.value : null;
+};
+
+// 常用主题色映射
+const SCHEME_COLORS = {
+  bg1: "FFFFFF", lt1: "FFFFFF", tx1: "000000", dk1: "000000",
+  bg2: "E7E6E6", lt2: "E7E6E6", tx2: "44546A", dk2: "44546A",
+  accent1: "4472C4", accent2: "ED7D31", accent3: "A5A5A5",
+  accent4: "FFC000", accent5: "5B9BD5", accent6: "70AD47",
+};
+
+function solidColorOf(container) {
+  if (!container) return null;
+  const sf = Array.from(container.children).find((c) => c.localName === "solidFill") ||
+    tagsLocal(container, "solidFill")[0];
+  if (!sf) return null;
+  const srgb = tagsLocal(sf, "srgbClr")[0];
+  if (srgb) return "#" + (attrL(srgb, "val") || "000000").replace(/^#/, "");
+  const scheme = tagsLocal(sf, "schemeClr")[0];
+  if (scheme) {
+    const v = SCHEME_COLORS[(attrL(scheme, "val") || "").toLowerCase()];
+    return v ? "#" + v : null;
+  }
+  return null;
+}
+
+function parseSlideRels(xml) {
+  const map = {};
+  if (!xml) return map;
+  const doc = new DOMParser().parseFromString(xml, "text/xml");
+  for (const rel of tagsLocal(doc, "Relationship")) {
+    map[attrL(rel, "Id")] = attrL(rel, "Target") || "";
+  }
+  return map;
+}
+
+// 解析一页幻灯片为形状/图片列表（按文档顺序）
+function parseSlideShapes(doc, relMap) {
+  const items = [];
+  const spTree = tagsLocal(doc, "spTree")[0];
+  if (!spTree) return items;
+  for (const el of spTree.getElementsByTagName("*")) {
+    if (el.localName === "sp") {
+      let x = 0, y = 0, w = 0, h = 0, fill = null;
+      const spPr = tagsLocal(el, "spPr")[0];
+      if (spPr) {
+        const xfrm = tagsLocal(spPr, "xfrm")[0];
+        if (xfrm) {
+          const off = tagsLocal(xfrm, "off")[0], ext = tagsLocal(xfrm, "ext")[0];
+          if (off) { x = +attrL(off, "x") || 0; y = +attrL(off, "y") || 0; }
+          if (ext) { w = +attrL(ext, "cx") || 0; h = +attrL(ext, "cy") || 0; }
+        }
+        fill = solidColorOf(spPr);
+      }
+      const paras = [];
+      const txBody = tagsLocal(el, "txBody")[0];
+      if (txBody) {
+        for (const p of Array.from(txBody.children).filter((c) => c.localName === "p")) {
+          const pPr = Array.from(p.children).find((c) => c.localName === "pPr");
+          const algn = pPr ? attrL(pPr, "algn") : null;
+          const segs = [];
+          for (const r of tagsLocal(p, "r")) {
+            const t = tagsLocal(r, "t")[0];
+            if (!t) continue;
+            const rPr = tagsLocal(r, "rPr")[0];
+            const sz = rPr ? +attrL(rPr, "sz") || 0 : 0; // 百分之一磅
+            const bold = rPr ? attrL(rPr, "b") === "1" : false;
+            const color = rPr ? solidColorOf(rPr) : null;
+            segs.push({ text: t.textContent, sizePt: sz ? sz / 100 : 18, bold, color });
+          }
+          paras.push({ algn: algn === "ctr" ? "ctr" : algn === "r" ? "r" : "l", segs, empty: segs.length === 0 });
+        }
+      }
+      items.push({ kind: "sp", x, y, w, h, fill, paras });
+    } else if (el.localName === "pic") {
+      const blip = tagsLocal(el, "blip")[0];
+      const rid = blip ? attrL(blip, "embed") : null;
+      let x = 0, y = 0, w = 0, h = 0;
+      const spPr = tagsLocal(el, "spPr")[0];
+      if (spPr) {
+        const xfrm = tagsLocal(spPr, "xfrm")[0];
+        if (xfrm) {
+          const off = tagsLocal(xfrm, "off")[0], ext = tagsLocal(xfrm, "ext")[0];
+          if (off) { x = +attrL(off, "x") || 0; y = +attrL(off, "y") || 0; }
+          if (ext) { w = +attrL(ext, "cx") || 0; h = +attrL(ext, "cy") || 0; }
+        }
+      }
+      const target = rid ? relMap[rid] : null;
+      if (target) {
+        items.push({
+          kind: "pic", x, y, w, h,
+          path: "ppt/" + target.replace(/^\.\.\//, "").replace(/^\//, "").replace(/^ppt\//, ""),
+        });
+      }
+    }
+  }
+  return items;
+}
+
+// 逐字换行（对中英文都稳妥）
+function wrapChars(ctx, paras, maxW, pxPerPt, baseFont) {
+  const out = []; // { chars:[{ch,w,px,bold,color}], lh, algn }
+  for (const para of paras) {
+    const chars = [];
+    let maxPx = 18 * pxPerPt;
+    for (const seg of para.segs) {
+      const px = Math.max(8, seg.sizePt * pxPerPt);
+      maxPx = Math.max(maxPx, px);
+      for (const ch of seg.text) {
+        if (ch === "\n" || ch === "\r") continue;
+        if (ch === "\u000b") { chars.push({ br: true }); continue; }
+        chars.push({ ch, px, bold: seg.bold, color: seg.color || "#1a1a1a" });
+      }
+    }
+    const lines = [];
+    let line = [], w = 0;
+    for (const item of chars) {
+      if (item.br) { lines.push(line); line = []; w = 0; continue; }
+      ctx.font = (item.bold ? "bold " : "") + item.px + "px " + baseFont;
+      const cw = ctx.measureText(item.ch).width;
+      if (w + cw > maxW && line.length) { lines.push(line); line = []; w = 0; }
+      line.push({ ...item, w: cw });
+      w += cw;
+    }
+    if (line.length || (!chars.length && para.empty)) lines.push(line);
+    for (const ln of lines) {
+      out.push({
+        chars: ln,
+        lh: (ln.length ? Math.max(...ln.map((c) => c.px)) : 18 * pxPerPt) * 1.35,
+        algn: para.algn,
+      });
+    }
+  }
+  return out;
+}
+
+async function loadBlobImage(blob) {
+  return new Promise((res, rej) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => res(img);
+    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error("图片解码失败")); };
+    img.src = url;
+  });
+}
+
+async function renderSlideCanvas(items, zip, cx, cy, W) {
+  const scale = W / cx;
+  const H = Math.max(1, Math.round(cy * scale));
+  const c = document.createElement("canvas");
+  c.width = W; c.height = H;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, W, H);
+  const pxPerPt = W / (cx / 12700);
+  const FONT = '"Microsoft YaHei","PingFang SC","Segoe UI",sans-serif';
+
+  for (const it of items) {
+    const X = it.x * scale, Y = it.y * scale, Wd = it.w * scale, Hd = it.h * scale;
+    try {
+      if (it.kind === "pic") {
+        const data = zip[it.path];
+        if (data) {
+          const img = await loadBlobImage(new Blob([data]));
+          ctx.drawImage(img, X, Y, Wd || img.naturalWidth * scale, Hd || img.naturalHeight * scale);
+          URL.revokeObjectURL(img.src);
+        }
+        continue;
+      }
+      if (it.fill && Wd > 0 && Hd > 0) {
+        ctx.fillStyle = it.fill;
+        ctx.fillRect(X, Y, Wd, Hd);
+      }
+      if (!it.paras.length) continue;
+      const padX = Math.min(24, Wd * 0.06);
+      const padY = Math.min(18, Hd * 0.05);
+      const lines = wrapChars(ctx, it.paras, Math.max(20, Wd - padX * 2), pxPerPt, FONT);
+      let y = Y + padY;
+      for (const ln of lines) {
+        if (y + ln.lh > Y + Hd + 4) break; // 溢出截断
+        const lineW = ln.chars.reduce((s, ch) => s + ch.w, 0);
+        let x = X + padX;
+        if (ln.algn === "ctr") x += (Wd - padX * 2 - lineW) / 2;
+        else if (ln.algn === "r") x += Wd - padX * 2 - lineW;
+        for (const ch of ln.chars) {
+          ctx.font = (ch.bold ? "bold " : "") + ch.px + "px " + FONT;
+          ctx.fillStyle = ch.color;
+          ctx.fillText(ch.ch, x, y);
+          x += ch.w;
+        }
+        y += ln.lh;
+      }
+    } catch (e) { /* 单个形状失败不中断整页 */ }
+  }
+  return c;
+}
+
+async function canvasesToPdf(canvases, pageWpt, pageHpt) {
+  const pdf = await PDFLib.PDFDocument.create();
+  for (const c of canvases) {
+    const img = await pdf.embedPng(c.toDataURL("image/png"));
+    const page = pdf.addPage([pageWpt, pageHpt]);
+    page.drawImage(img, { x: 0, y: 0, width: pageWpt, height: pageHpt });
+  }
+  return new Blob([await pdf.save()], { type: "application/pdf" });
+}
+
+async function convertPptx(file, target) {
+  if (typeof fflate === "undefined" || typeof PDFLib === "undefined")
+    throw new Error("转换组件加载失败，请刷新页面");
+  const zip = fflate.unzipSync(new Uint8Array(await file.arrayBuffer()));
+  const dec = new TextDecoder();
+  const readStr = (n) => (zip[n] ? dec.decode(zip[n]) : null);
+  const presXml = readStr("ppt/presentation.xml");
+  if (!presXml) throw new Error("不是有效的 PPTX 文件（旧版 .ppt 不受支持，请先另存为 .pptx）");
+  const m = presXml.match(/<p:sldSz[^>]*cx="(\d+)"[^>]*cy="(\d+)"/);
+  const cx = m ? +m[1] : 12192000, cy = m ? +m[2] : 6858000;
+
+  const presDoc = new DOMParser().parseFromString(presXml, "text/xml");
+  const presRels = parseSlideRels(readStr("ppt/_rels/presentation.xml.rels"));
+  const slidePaths = tagsLocal(presDoc, "sldId")
+    .map((sid) => {
+      // sldId 同时带无前缀 id="256" 与带前缀 r:id="rIdN"，必须取带前缀的关系 ID
+      const relAttr = Array.from(sid.attributes).find((a) => a.localName === "id" && a.name !== "id");
+      const t = presRels[relAttr ? relAttr.value : ""] || "";
+      return "ppt/" + t.replace(/^\.\.\//, "").replace(/^\//, "").replace(/^ppt\//, "");
+    })
+    .filter((p) => zip[p]);
+  if (!slidePaths.length) throw new Error("未找到幻灯片");
+
+  const W = 1600;
+  const canvases = [];
+  for (const path of slidePaths) {
+    const relPath = path.replace(/slides\/(slide\d+\.xml)$/, "slides/_rels/$1.rels");
+    const relMap = parseSlideRels(readStr(relPath));
+    const items = parseSlideShapes(new DOMParser().parseFromString(readStr(path), "text/xml"), relMap);
+    canvases.push(await renderSlideCanvas(items, zip, cx, cy, W));
+  }
+  if (!canvases.length) throw new Error("未能渲染任何幻灯片");
+
+  if (target === "png") {
+    return Promise.all(canvases.map((c) => canvasBlob(c, "image/png")));
+  }
+  return [await canvasesToPdf(canvases, cx / 12700, cy / 12700)];
+}
+
+/* ================= TXT / MD → PDF（A4 排版） ================= */
+
+function mdBlocksForPdf(src) {
+  const lines = src.replace(/\r\n/g, "\n").split("\n");
+  const blocks = [];
+  let para = [], inCode = false, codeBuf = [];
+  const flush = () => {
+    if (para.length) { blocks.push({ type: "p", text: para.join("\n") }); para = []; }
+  };
+  const strip = (s) => s
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(\*|_)([^*_]+)\1/g, "$2")
+    .replace(/~~([^~]+)~~/g, "$1")
+    .replace(/`([^`]+)`/g, "$1");
+  for (const line of lines) {
+    if (/^```/.test(line)) {
+      if (inCode) { blocks.push({ type: "code", text: codeBuf.join("\n") }); codeBuf = []; inCode = false; }
+      else { flush(); inCode = true; }
+      continue;
+    }
+    if (inCode) { codeBuf.push(line); continue; }
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h) { flush(); blocks.push({ type: "h", level: h[1].length, text: strip(h[2]) }); continue; }
+    if (/^\s*([-*_])\s*\1\s*\1[\s\1]*$/.test(line)) { flush(); blocks.push({ type: "hr" }); continue; }
+    if (/^>\s?/.test(line)) { flush(); blocks.push({ type: "quote", text: strip(line.replace(/^>\s?/, "")) }); continue; }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      flush();
+      blocks.push({ type: "li", text: strip(line.replace(/^\s*[-*+]\s+/, "")) });
+      continue;
+    }
+    if (/^\s*\d+[.)]\s+/.test(line)) {
+      flush();
+      blocks.push({ type: "li", text: strip(line.replace(/^\s*\d+[.)]\s+/, "")) });
+      continue;
+    }
+    if (!line.trim()) { flush(); continue; }
+    para.push(strip(line));
+  }
+  flush();
+  if (inCode && codeBuf.length) blocks.push({ type: "code", text: codeBuf.join("\n") });
+  return blocks;
+}
+
+async function textToPdf(text, markdown) {
+  const SCALE = 2;
+  const W = 1191, H = 1684, M = 128; // A4 @144dpi，边距 64pt
+  const CW = W - M * 2;
+  const FONT = '"Microsoft YaHei","PingFang SC","Segoe UI",sans-serif';
+  const MONO = 'Consolas,"Courier New",monospace';
+
+  const pages = [];
+  let ctx, y;
+  const newPage = () => {
+    const c = document.createElement("canvas");
+    c.width = W; c.height = H;
+    ctx = c.getContext("2d");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, W, H);
+    pages.push(c);
+    y = M;
+  };
+  newPage();
+  const need = (h) => {
+    if (y + h > H - M) newPage();
+  };
+  const wrapText = (s, font, maxW) => {
+    ctx.font = font;
+    const lines = [];
+    for (const raw of s.split("\n")) {
+      let line = "";
+      for (const ch of raw) {
+        if (ctx.measureText(line + ch).width > maxW && line) { lines.push(line); line = ch; }
+        else line += ch;
+      }
+      lines.push(line);
+    }
+    return lines;
+  };
+  const drawBlock = (text, font, lh, color, opts) => {
+    opts = opts || {};
+    const lines = wrapText(text, font, CW - (opts.indent || 0));
+    for (const ln of lines) {
+      need(lh);
+      if (opts.bar) {
+        ctx.fillStyle = "#c9c9c9";
+        ctx.fillRect(M - 18, y - lh * 0.8, 5, lh);
+      }
+      ctx.font = font;
+      ctx.fillStyle = color || "#1a1a1a";
+      ctx.fillText(ln, M + (opts.indent || 0), y);
+      y += lh;
+    }
+  };
+
+  const styles = {
+    h1: { font: "bold 52px " + FONT, lh: 66 },
+    h2: { font: "bold 40px " + FONT, lh: 54 },
+    h3: { font: "bold 32px " + FONT, lh: 44 },
+    h4: { font: "bold 26px " + FONT, lh: 38 },
+    body: { font: "22px " + FONT, lh: 34 },
+    code: { font: "19px " + MONO, lh: 28 },
+  };
+
+  if (markdown) {
+    for (const b of mdBlocksForPdf(text)) {
+      if (b.type === "hr") {
+        need(30);
+        ctx.fillStyle = "#d0d0d0";
+        ctx.fillRect(M, y, CW, 2);
+        y += 30;
+      } else if (b.type === "code") {
+        for (const ln of b.text.split("\n")) {
+          need(30);
+          ctx.fillStyle = "#f0f0f0";
+          ctx.fillRect(M - 10, y - 22, CW + 20, 28);
+          ctx.font = styles.code.font;
+          ctx.fillStyle = "#1a1a1a";
+          ctx.fillText(ln, M, y);
+          y += 28;
+        }
+        y += 10;
+      } else if (b.type === "li") {
+        drawBlock("• " + b.text, styles.body.font, styles.body.lh, "#1a1a1a", { indent: 16 });
+      } else if (b.type === "quote") {
+        drawBlock(b.text, styles.body.font, styles.body.lh, "#666666", { indent: 16, bar: true });
+      } else if (b.type === "h") {
+        const st = styles["h" + Math.min(4, b.level)];
+        y += 12;
+        drawBlock(b.text, st.font, st.lh, "#111111");
+        if (b.level <= 2) {
+          need(16);
+          ctx.fillStyle = "#d8d8d8";
+          ctx.fillRect(M, y, CW, 2);
+          y += 16;
+        }
+      } else {
+        drawBlock(b.text, styles.body.font, styles.body.lh, "#1a1a1a");
+      }
+      y += 10;
+    }
+  } else {
+    for (const para of text.split(/\r?\n/)) {
+      if (!para.trim()) { y += 17; continue; }
+      drawBlock(para, styles.body.font, styles.body.lh, "#1a1a1a");
+    }
+  }
+  return [await canvasesToPdf(pages, 595.28, 841.89)];
+}
+
 /* ================= 主流程 ================= */
 
 function extTargetLabel(t) { return t.toUpperCase(); }
@@ -534,7 +941,7 @@ function renderFormats() {
 function addFiles(list) {
   for (const f of list) {
     const e = extOf(f.name);
-    if (isImage(e) || isDoc(e)) state.files.push({ file: f });
+    if (isSupported(e)) state.files.push({ file: f });
   }
   renderFiles();
 }
@@ -582,32 +989,46 @@ convertBtn.addEventListener("click", async () => {
   const quality = +qualityInput.value;
   let okCount = 0;
 
-  for (let i = 0; i < state.files.length; i++) {
-    const item = state.files[i];
+  const queue = [...state.files];
+  for (let i = 0; i < queue.length; i++) {
+    const item = queue[i];
     const ext = extOf(item.file.name);
-    const outName = baseName(item.file.name) + "." + target;
     const li = document.createElement("li");
     li.className = "result-item";
-    li.innerHTML = `<span class="file-name">${escapeHtml(outName)}</span>
+    li.innerHTML = `<span class="file-name">${escapeHtml(item.file.name)} → ${escapeHtml(target.toUpperCase())}</span>
       <span class="file-status wait">转换中…</span>`;
     resultList.appendChild(li);
     const statusEl = li.querySelector(".file-status");
 
     try {
-      let blob;
-      if (isImage(ext)) blob = await convertImage(item.file, target, quality);
-      else blob = await convertDoc(item.file, target);
-      item.result = blob;
+      let out;
+      if (ext === "pptx") out = await convertPptx(item.file, target);
+      else if (isImage(ext)) out = await convertImage(item.file, target, quality);
+      else if (target === "pdf") out = await textToPdf(await readText(item.file), ext === "md" || ext === "markdown");
+      else out = await convertDoc(item.file, target);
+      const outs = Array.isArray(out) ? out : [out];
+      const base = baseName(item.file.name);
+      let totalSize = 0;
+      outs.forEach((blob, k) => {
+        totalSize += blob.size;
+        const nm = outs.length > 1
+          ? base + "-" + String(k + 1).padStart(2, "0") + "." + target
+          : base + "." + target;
+        const row = document.createElement("li");
+        row.className = "result-item";
+        row.innerHTML = `<span class="file-name">${escapeHtml(nm)}</span>
+          <span class="file-status ok">✓ ${fmtSize(blob.size)}</span>`;
+        const btn = document.createElement("button");
+        btn.className = "dl-btn";
+        btn.textContent = "下载";
+        btn.onclick = () => download(blob, nm);
+        row.insertBefore(btn, row.querySelector(".file-status"));
+        resultList.appendChild(row);
+        setTimeout(() => download(blob, nm), (i * 400) + k * 150);
+      });
       okCount++;
-      const btn = document.createElement("button");
-      btn.className = "dl-btn";
-      btn.textContent = "下载";
-      btn.onclick = () => download(blob, outName);
-      li.insertBefore(btn, statusEl);
-      statusEl.textContent = "✓ " + fmtSize(blob.size);
+      statusEl.textContent = "✓ " + (outs.length > 1 ? outs.length + " 个文件 · " : "") + fmtSize(totalSize);
       statusEl.className = "file-status ok";
-      // 自动逐个下载（多个文件间隔触发，避免被浏览器拦截）
-      setTimeout(() => download(blob, outName), i * 400);
       // 转换完成后从待转换列表移除
       const idx = state.files.indexOf(item);
       if (idx > -1) state.files.splice(idx, 1);
@@ -627,4 +1048,19 @@ convertBtn.addEventListener("click", async () => {
   convertBtn.classList.remove("converting");
   convertBtn.textContent = "开始转换";
   convertBtn.disabled = !state.files.length || !state.target;
+});
+
+/* ================= 深色 / 浅色主题切换 ================= */
+const themeToggle = $("#themeToggle");
+function applyTheme(t) {
+  document.body.dataset.theme = t;
+  themeToggle.textContent = t === "light" ? "☾" : "☀";
+}
+let theme = "dark";
+try { theme = localStorage.getItem("fc-theme") === "light" ? "light" : "dark"; } catch (e) {}
+applyTheme(theme);
+themeToggle.addEventListener("click", () => {
+  theme = theme === "light" ? "dark" : "light";
+  try { localStorage.setItem("fc-theme", theme); } catch (e) {}
+  applyTheme(theme);
 });
