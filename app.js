@@ -947,6 +947,35 @@ function addFiles(list) {
 }
 
 /* --- 事件绑定 --- */
+const hasDragFiles = (e) => {
+  const dt = e.dataTransfer;
+  return !!dt && Array.prototype.indexOf.call(dt.types || [], "Files") !== -1;
+};
+
+// 全页拖放：文件拖到页面任何位置松手都能添加，
+// 并阻止浏览器用默认行为打开被拖入的文件（这是"拖了没反应"的常见原因）
+let dragDepth = 0;
+window.addEventListener("dragover", (e) => {
+  if (hasDragFiles(e)) e.preventDefault();
+});
+window.addEventListener("dragenter", (e) => {
+  if (!hasDragFiles(e)) return;
+  dragDepth++;
+  dropzone.classList.add("dragover");
+});
+window.addEventListener("dragleave", (e) => {
+  if (!hasDragFiles(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) dropzone.classList.remove("dragover");
+});
+window.addEventListener("drop", (e) => {
+  if (!hasDragFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  dropzone.classList.remove("dragover");
+  addFiles(e.dataTransfer.files);
+});
+
 dropzone.addEventListener("click", () => fileInput.click());
 dropzone.addEventListener("keydown", (e) => {
   if (e.key === "Enter" || e.key === " ") fileInput.click();
@@ -961,13 +990,11 @@ fileInput.addEventListener("change", () => {
     dropzone.classList.add("dragover");
   })
 );
-["dragleave", "drop"].forEach((ev) =>
-  dropzone.addEventListener(ev, (e) => {
-    e.preventDefault();
-    dropzone.classList.remove("dragover");
-  })
-);
-dropzone.addEventListener("drop", (e) => addFiles(e.dataTransfer.files));
+dropzone.addEventListener("dragleave", (e) => {
+  e.preventDefault();
+  dropzone.classList.remove("dragover");
+});
+dropzone.addEventListener("drop", (e) => e.preventDefault()); // 只管视觉，真正的添加在 window 级处理，避免重复
 window.addEventListener("paste", (e) => {
   if (e.clipboardData && e.clipboardData.files.length) addFiles(e.clipboardData.files);
 });
