@@ -39,6 +39,7 @@ const state = { files: [], target: null, converting: false };
 /* ---------- DOM ---------- */
 const $ = (s) => document.querySelector(s);
 const dropzone = $("#dropzone");
+const dropOverlay = $("#dropOverlay");
 const fileInput = $("#fileInput");
 const fileList = $("#fileList");
 const formatGroup = $("#formatGroup");
@@ -939,11 +940,34 @@ function renderFormats() {
 }
 
 function addFiles(list) {
+  let skipped = 0;
   for (const f of list) {
     const e = extOf(f.name);
     if (isSupported(e)) state.files.push({ file: f });
+    else skipped++;
   }
   renderFiles();
+  if (skipped) {
+    toast(`已忽略 ${skipped} 个不支持的文件，支持：图片 / MD·TXT·HTML·CSV·JSON / PPTX`);
+  }
+}
+
+function toast(msg) {
+  const t = document.createElement("div");
+  t.className = "toast";
+  t.textContent = msg;
+  document.body.appendChild(t);
+  requestAnimationFrame(() => t.classList.add("show"));
+  setTimeout(() => {
+    t.classList.remove("show");
+    setTimeout(() => t.remove(), 350);
+  }, 2800);
+}
+
+// 拖拽视觉反馈：全页提示层 + 投放区高亮
+function setDragVisual(on) {
+  dropOverlay.hidden = !on;
+  dropzone.classList.toggle("dragover", on);
 }
 
 /* --- 事件绑定 --- */
@@ -961,18 +985,18 @@ window.addEventListener("dragover", (e) => {
 window.addEventListener("dragenter", (e) => {
   if (!hasDragFiles(e)) return;
   dragDepth++;
-  dropzone.classList.add("dragover");
+  setDragVisual(true);
 });
 window.addEventListener("dragleave", (e) => {
   if (!hasDragFiles(e)) return;
   dragDepth = Math.max(0, dragDepth - 1);
-  if (!dragDepth) dropzone.classList.remove("dragover");
+  if (!dragDepth) setDragVisual(false);
 });
 window.addEventListener("drop", (e) => {
   if (!hasDragFiles(e)) return;
   e.preventDefault();
   dragDepth = 0;
-  dropzone.classList.remove("dragover");
+  setDragVisual(false);
   addFiles(e.dataTransfer.files);
 });
 
