@@ -26,12 +26,14 @@ const CONV_MAP = {
   htm: ["md", "txt"],
   csv: ["json", "md"],
   json: ["csv", "md"],
+  // Word 文档
+  docx: ["pdf", "md", "html", "txt"],
   // 演示文稿
   pptx: ["pdf", "png"],
 };
 
 const ICO_SIZES = [16, 32, 48, 64, 128, 256];
-const isSupported = (ext) => IMAGE_EXTS.includes(ext) || DOC_EXTS.includes(ext) || ext === "pptx";
+const isSupported = (ext) => IMAGE_EXTS.includes(ext) || DOC_EXTS.includes(ext) || ext === "pptx" || ext === "docx";
 
 /* ---------- 状态 ---------- */
 const state = { files: [], target: null, converting: false };
@@ -879,6 +881,292 @@ async function textToPdf(text, markdown) {
   return [await canvasesToPdf(pages, 595.28, 841.89)];
 }
 
+/* ================= DOCX → MD / HTML / TXT / PDF（尽力渲染） ================= */
+
+// 解析 numbering.xml：numId → level0 编号格式（bullet / decimal / ...）
+function docxNumberingMap(zip, dec) {
+  const map = {};
+  const xml = zip["word/numbering.xml"];
+  if (!xml) return map;
+  const doc = new DOMParser().parseFromString(dec.decode(xml), "text/xml");
+  const abstract = {};
+  for (const an of tagsLocal(doc, "abstractNum")) {
+    const id = attrL(an, "abstractNumId");
+    const lvl0 = tagsLocal(an, "lvl").find((l) => attrL(l, "ilvl") === "0");
+    const fmt = lvl0 ? tagsLocal(lvl0, "numFmt")[0] : null;
+    if (id && fmt) abstract[id] = attrL(fmt, "val") || "bullet";
+  }
+  for (const num of tagsLocal(doc, "num")) {
+    const id = attrL(num, "numId");
+    const ref = tagsLocal(num, "abstractNumId")[0];
+    if (id && ref) map[id] = abstract[attrL(ref, "val")] || "bullet";
+  }
+  return map;
+}
+
+// 提取一个 run 的文本与样式
+function docxRun(r) {
+  let text = "";
+  for (const node of r.getElementsByTagName("*")) {
+    if (node.localName === "t") text += node.textContent;
+    else if (node.localName === "tab") text += "\t";
+    else if (node.localName === "br") text += "\n";
+  }
+  if (!text) return null;
+  const rPr = tagsLocal(r, "rPr")[0];
+  const flag = (name) => {
+    if (!rPr) return false;
+    const el = tagsLocal(rPr, name)[0];
+    if (!el) return false;
+    const v = attrL(el, "val");
+    return v !== "0" && v !== "false" && v !== "none";
+  };
+  return { text, bold: flag("b"), italic: flag("i") };
+}
+
+// 解析 styles.xml：styleId → { name, numId }（列表样式常把 numPr 定义在样式级）
+function docxStyleMap(zip, dec) {
+  const map = {};
+  const xml = zip["word/styles.xml"];
+  if (!xml) return map;
+  const doc = new DOMParser().parseFromString(dec.decode(xml), "text/xml");
+  for (const st of tagsLocal(doc, "style")) {
+    const id = attrL(st, "styleId");
+    if (!id) continue;
+    const nameEl = tagsLocal(st, "name")[0];
+    const name = nameEl ? (attrL(nameEl, "val") || "").toLowerCase() : "";
+    let numId = null;
+    const pPr = tagsLocal(st, "pPr")[0];
+    if (pPr) {
+      const numPr = tagsLocal(pPr, "numPr")[0];
+      const nid = numPr ? tagsLocal(numPr, "numId")[0] : null;
+      numId = nid ? attrL(nid, "val") : null;
+    }
+    map[id] = { name, numId };
+  }
+  return map;
+}
+
+// 解析段落 → blocks
+function docxPara(el, blocks, numFmtMap, styleMap) {
+  const pPr = tagsLocal(el, "pPr")[0];
+  let level = 0, isList = false, numFmt = "bullet", numKey = "";
+  if (pPr) {
+    const style = tagsLocal(pPr, "pStyle")[0];
+    const sv = style ? (attrL(style, "val") || "").toLowerCase() : "";
+    const styleRaw = style ? attrL(style, "val") : "";
+    if (sv.startsWith("heading")) level = Math.min(6, parseInt(sv.replace("heading"), 10) || 1);
+    else if (sv === "title") level = 1;
+    else if (sv === "subtitle") level = 2;
+    const numPr = tagsLocal(pPr, "numPr")[0];
+    if (numPr) {
+      const numIdEl = tagsLocal(numPr, "numId")[0];
+      const numId = numIdEl ? attrL(numIdEl, "val") : null;
+      if (numId && numId !== "0") {
+        isList = true;
+        numFmt = numFmtMap[numId] || "bullet";
+        numKey = numId;
+      }
+    }
+    if (!isList && styleRaw) {
+      // 回退：列表编号定义在样式级 numPr
+      const st = styleMap[styleRaw];
+      if (st && st.numId && st.numId !== "0") {
+        isList = true;
+        numKey = st.numId;
+        numFmt = numFmtMap[st.numId] || (/number/.test(st.name) ? "decimal" : "bullet");
+      } else if (st && /list\s*(bullet|number)/.test(st.name)) {
+        isList = true;
+        numKey = "style:" + styleRaw;
+        numFmt = /number/.test(st.name) ? "decimal" : "bullet";
+      }
+    }
+  }
+  const runs = [];
+  for (const r of tagsLocal(el, "r")) {
+    const run = docxRun(r);
+    if (run) runs.push(run);
+  }
+  const text = runs.map((r) => r.text).join("");
+  if (isList) blocks.push({ type: "li", runs, ordered: numFmt !== "bullet", numKey });
+  else if (level) blocks.push({ type: "h", level, runs });
+  else if (text.trim()) blocks.push({ type: "p", runs });
+  else if (blocks.length && blocks[blocks.length - 1].type !== "sp") blocks.push({ type: "sp" });
+}
+
+// 解析表格 → rows（每格为纯文本）
+function docxTable(el, blocks) {
+  const rows = [];
+  for (const tr of tagsLocal(el, "tr")) {
+    const cells = [];
+    for (const tc of tagsLocal(tr, "tc")) {
+      const parts = [];
+      for (const p of tagsLocal(tc, "p")) {
+        const t = tagsLocal(p, "r")
+          .map((r) => docxRun(r))
+          .filter(Boolean)
+          .map((r) => r.text)
+          .join("");
+        if (t.trim()) parts.push(t.trim());
+      }
+      cells.push(parts.join(" "));
+    }
+    rows.push(cells);
+  }
+  if (rows.length) blocks.push({ type: "table", rows });
+}
+
+// docx → 中间块结构
+function parseDocxBlocks(zip, dec) {
+  const docXml = zip["word/document.xml"];
+  if (!docXml) throw new Error("不是有效的 DOCX 文件（旧版 .doc 请先另存为 .docx）");
+  const doc = new DOMParser().parseFromString(dec.decode(docXml), "text/xml");
+  const body = tagsLocal(doc, "body")[0];
+  if (!body) throw new Error("DOCX 解析失败");
+  const numFmtMap = docxNumberingMap(zip, dec);
+  const styleMap = docxStyleMap(zip, dec);
+  const blocks = [];
+  for (const el of Array.from(body.children)) {
+    if (el.localName === "p") docxPara(el, blocks, numFmtMap, styleMap);
+    else if (el.localName === "tbl") docxTable(el, blocks);
+  }
+  while (blocks.length && blocks[blocks.length - 1].type === "sp") blocks.pop();
+  if (!blocks.length) throw new Error("未找到文本内容（纯图片型文档暂不支持）");
+  return blocks;
+}
+
+// 行内 run → markdown 片段
+function docxRunsToMd(runs) {
+  return runs
+    .map((r) => {
+      const t = r.text.replace(/\n+/g, " ").replace(/\t+/g, " ");
+      if (r.bold && r.italic) return "***" + t + "***";
+      if (r.bold) return "**" + t + "**";
+      if (r.italic) return "*" + t + "*";
+      return t;
+    })
+    .join("");
+}
+const docxCellPlain = (runs) => runs.map((r) => r.text).join("").replace(/\|/g, "\\|").replace(/\n+/g, " ").trim();
+
+function docxBlocksToMd(blocks) {
+  const chunks = []; // 每个块/连续列表 = 一组行，块间以空行分隔
+  let prev = null;
+  const counters = {};
+  for (const b of blocks) {
+    const continuous =
+      prev && prev.type === "li" && b.type === "li" &&
+      prev.ordered === b.ordered && prev.numKey === b.numKey;
+    if (!continuous) chunks.push([]);
+    const cur = chunks[chunks.length - 1];
+    if (b.type === "h") cur.push("#".repeat(b.level) + " " + docxRunsToMd(b.runs));
+    else if (b.type === "p") cur.push(docxRunsToMd(b.runs));
+    else if (b.type === "sp") cur.push("");
+    else if (b.type === "li") {
+      counters[b.numKey] = counters[b.numKey] || 0;
+      const prefix = b.ordered ? ++counters[b.numKey] + ". " : "- ";
+      cur.push(prefix + docxRunsToMd(b.runs));
+    } else if (b.type === "table") {
+      const w = Math.max(...b.rows.map((r) => r.length));
+      const pad = (r) => { const c = [...r]; while (c.length < w) c.push(""); return c; };
+      const rows = b.rows.map(pad);
+      cur.push("| " + rows[0].join(" | ") + " |");
+      cur.push("| " + rows[0].map(() => "---").join(" | ") + " |");
+      for (const r of rows.slice(1)) cur.push("| " + r.join(" | ") + " |");
+    }
+    prev = b;
+  }
+  return chunks.map((c) => c.join("\n")).join("\n\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+}
+
+function docxBlocksToHtml(blocks, title) {
+  const inline = (runs) =>
+    runs
+      .map((r) => {
+        const t = escapeHtml(r.text).replace(/\n/g, "<br>").replace(/\t/g, "&emsp;");
+        if (r.bold && r.italic) return "<strong><em>" + t + "</em></strong>";
+        if (r.bold) return "<strong>" + t + "</strong>";
+        if (r.italic) return "<em>" + t + "</em>";
+        return t;
+      })
+      .join("");
+  const parts = [];
+  let listTag = null;
+  const closeList = () => { if (listTag) { parts.push("</" + listTag + ">"); listTag = null; } };
+  for (const b of blocks) {
+    if (b.type === "li") {
+      const tag = b.ordered ? "ol" : "ul";
+      if (listTag !== tag) { closeList(); parts.push("<" + tag + ">"); listTag = tag; }
+      parts.push("<li>" + inline(b.runs) + "</li>");
+    } else {
+      closeList();
+      if (b.type === "h") parts.push(`<h${b.level}>` + inline(b.runs) + `</h${b.level}>`);
+      else if (b.type === "p") parts.push("<p>" + inline(b.runs) + "</p>");
+      else if (b.type === "sp") parts.push("<p><br></p>");
+      else if (b.type === "table") {
+        let t = "<table><thead><tr>";
+        for (const c of b.rows[0]) t += "<th>" + escapeHtml(c) + "</th>";
+        t += "</tr></thead><tbody>";
+        for (const r of b.rows.slice(1)) {
+          t += "<tr>";
+          for (const c of r) t += "<td>" + escapeHtml(c) + "</td>";
+          t += "</tr>";
+        }
+        parts.push(t + "</tbody></table>");
+      }
+    }
+  }
+  closeList();
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${escapeHtml(title)}</title>
+<style>
+body{font-family:"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;line-height:1.7;color:#1a1a1a;background:#fff;margin:0;padding:40px 20px}
+main{max-width:760px;margin:0 auto}
+h1,h2,h3,h4,h5,h6{line-height:1.4;margin:1.4em 0 .6em}
+h1{font-size:1.9em;border-bottom:1px solid #e0e0e0;padding-bottom:.3em}
+h2{font-size:1.5em;border-bottom:1px solid #eee;padding-bottom:.25em}
+table{border-collapse:collapse;width:100%;margin:1em 0;font-size:.95em}
+th,td{border:1px solid #d5d5d5;padding:8px 12px;text-align:left}
+th{background:#f4f4f4}
+li{margin:.3em 0}
+</style>
+</head>
+<body>
+<main>
+${parts.join("\n")}
+</main>
+</body>
+</html>
+`;
+}
+
+function docxBlocksToText(blocks) {
+  const out = [];
+  for (const b of blocks) {
+    if (b.type === "h" || b.type === "p" || b.type === "li")
+      out.push((b.type === "li" ? "• " : "") + b.runs.map((r) => r.text).join(""));
+    else if (b.type === "table") for (const r of b.rows) out.push(r.join("\t"));
+  }
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+}
+
+async function convertDocx(file, target) {
+  if (typeof fflate === "undefined") throw new Error("转换组件加载失败，请刷新页面");
+  const zip = fflate.unzipSync(new Uint8Array(await file.arrayBuffer()));
+  const dec = new TextDecoder();
+  const blocks = parseDocxBlocks(zip, dec);
+  const name = baseName(file.name);
+  if (target === "md") return new Blob([docxBlocksToMd(blocks)], { type: "text/markdown" });
+  if (target === "html") return new Blob([docxBlocksToHtml(blocks, name)], { type: "text/html" });
+  if (target === "txt") return new Blob([docxBlocksToText(blocks)], { type: "text/plain" });
+  if (target === "pdf") return textToPdf(docxBlocksToMd(blocks), true);
+  throw new Error("不支持的目标格式");
+}
+
 /* ================= 主流程 ================= */
 
 function extTargetLabel(t) { return t.toUpperCase(); }
@@ -1054,6 +1342,7 @@ convertBtn.addEventListener("click", async () => {
     try {
       let out;
       if (ext === "pptx") out = await convertPptx(item.file, target);
+      else if (ext === "docx") out = await convertDocx(item.file, target);
       else if (isImage(ext)) out = await convertImage(item.file, target, quality);
       else if (target === "pdf") out = await textToPdf(await readText(item.file), ext === "md" || ext === "markdown");
       else out = await convertDoc(item.file, target);

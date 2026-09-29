@@ -10,9 +10,10 @@
 |------|------|------|
 | 图片 | PNG / JPG / WEBP / GIF / BMP / ICO / SVG / AVIF | PNG / JPEG / WEBP / BMP / ICO（多尺寸） |
 | 文档 | Markdown / TXT / HTML / CSV / JSON | 相互转换，及 **PDF**（MD / TXT → A4 排版 PDF） |
+| Word | DOCX | **PDF** / Markdown / HTML / TXT（标题、加粗斜体、列表、表格） |
 | 演示文稿 | PPTX | **PDF**（逐页渲染）/ PNG（每页一张图） |
 
-> PPTX→PDF 为纯前端尽力渲染：支持文本（字号/加粗/颜色/对齐/自动换行）、纯色形状、嵌入图片；动画、母版与复杂主题样式不在还原范围。旧版 .ppt 请先在 PowerPoint 中另存为 .pptx。
+> PPTX / DOCX 为纯前端尽力渲染：支持文本、纯色形状、图片、标题样式、列表、表格；动画、母版与复杂排版不在还原范围。旧版 .ppt / .doc 请先在 Office 中另存为 .pptx / .docx。
 
 ## 特性
 
